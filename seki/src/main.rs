@@ -18,10 +18,15 @@ fn now() -> u64 { START.elapsed().as_secs() }
 macro_rules! metrics {
     ($($name:ident),*) => {
         $(static $name: AtomicU64 = AtomicU64::new(0);)*
-        fn render_metrics(active: u64) -> String {
+        fn render_metrics(active: u64, backends: &[(String, Arc<Stats>)]) -> String {
             let mut s = String::new();
             $(s += &format!("seki_{} {}\n", stringify!($name).to_ascii_lowercase(), $name.load(Relaxed));)*
             s += &format!("seki_flows_active {active}\n");
+            for (n, st) in backends {
+                for (m, v) in [("packets_in", &st.packets_in), ("bytes_in", &st.bytes_in), ("packets_out", &st.packets_out), ("bytes_out", &st.bytes_out), ("migrations", &st.migrations), ("flows_active", &st.active)] {
+                    s += &format!("seki_backend_{m}{{backend=\"{n}\"}} {}\n", v.load(Relaxed));
+                }
+            }
             s
         }
     };
@@ -29,14 +34,34 @@ macro_rules! metrics {
 metrics!(PACKETS_IN, BYTES_IN, PACKETS_OUT, BYTES_OUT, FLOWS_SNI, FLOWS_CID, FLOWS_FALLBACK, MIGRATIONS, SEND_ERRORS);
 static ACTIVE: AtomicU64 = AtomicU64::new(0);
 
+/// Per-backend counters; in = client→backend, out = backend→client.
+#[derive(Default)]
+struct Stats {
+    packets_in: AtomicU64,
+    bytes_in: AtomicU64,
+    packets_out: AtomicU64,
+    bytes_out: AtomicU64,
+    migrations: AtomicU64,
+    active: AtomicU64,
+}
+
+impl Stats {
+    fn add_in(&self, n: usize) {
+        self.packets_in.fetch_add(1, Relaxed);
+        self.bytes_in.fetch_add(n as u64, Relaxed);
+    }
+}
+
 struct Backend {
     name: String,
     addr: SocketAddr,
     routable: bool,
+    stats: Arc<Stats>,
 }
 
 struct Flow {
     up: Arc<UdpSocket>,
+    stats: Arc<Stats>,
     last: Arc<AtomicU64>,
     dead: Arc<AtomicBool>,
 }
@@ -89,6 +114,7 @@ impl Router {
         if let Some(f) = self.flows.get(&src) {
             if !f.dead.load(Relaxed) {
                 f.last.store(now(), Relaxed);
+                f.stats.add_in(pkt.len());
                 if f.up.send(pkt).await.is_err() {
                     SEND_ERRORS.fetch_add(1, Relaxed);
                 }
@@ -122,6 +148,7 @@ impl Router {
             }
         } else if let Some((i, sid)) = self.route_cid(&pkt[1..]) {
             MIGRATIONS.fetch_add(1, Relaxed);
+            self.backends[i].stats.migrations.fetch_add(1, Relaxed);
             return self.open(src, i, Reason::Cid(sid), vec![pkt.to_vec()]).await;
         }
         self.open(src, self.default, Reason::Fallback, vec![pkt.to_vec()]).await
@@ -157,14 +184,17 @@ impl Router {
             Reason::Fallback => { FLOWS_FALLBACK.fetch_add(1, Relaxed); debug!(%client, port = src.port(), backend = %b.name, "fallback flow") }
         }
         let idle = if b.routable { self.conn_timeout } else { self.flow_timeout };
-        let flow = Flow { up: up.clone(), last: Arc::new(AtomicU64::new(now())), dead: Arc::new(AtomicBool::new(false)) };
+        let stats = b.stats.clone();
+        let flow = Flow { up: up.clone(), stats: stats.clone(), last: Arc::new(AtomicU64::new(now())), dead: Arc::new(AtomicBool::new(false)) };
         for p in &pkts {
+            stats.add_in(p.len());
             if up.send(p).await.is_err() {
                 SEND_ERRORS.fetch_add(1, Relaxed);
             }
         }
         ACTIVE.fetch_add(1, Relaxed);
-        tokio::spawn(reply_loop(up, self.public.clone(), src, flow.last.clone(), flow.dead.clone(), idle, b.name.clone()));
+        stats.active.fetch_add(1, Relaxed);
+        tokio::spawn(reply_loop(up, stats, self.public.clone(), src, flow.last.clone(), flow.dead.clone(), idle, b.name.clone()));
         self.flows.insert(src, flow);
     }
 
@@ -177,7 +207,7 @@ impl Router {
     }
 }
 
-async fn reply_loop(up: Arc<UdpSocket>, public: Arc<UdpSocket>, client: SocketAddr, last: Arc<AtomicU64>, dead: Arc<AtomicBool>, idle: u64, backend: String) {
+async fn reply_loop(up: Arc<UdpSocket>, stats: Arc<Stats>, public: Arc<UdpSocket>, client: SocketAddr, last: Arc<AtomicU64>, dead: Arc<AtomicBool>, idle: u64, backend: String) {
     let mut buf = vec![0u8; 65535];
     loop {
         match tokio::time::timeout(Duration::from_secs(5), up.recv(&mut buf)).await {
@@ -185,6 +215,8 @@ async fn reply_loop(up: Arc<UdpSocket>, public: Arc<UdpSocket>, client: SocketAd
                 last.store(now(), Relaxed);
                 PACKETS_OUT.fetch_add(1, Relaxed);
                 BYTES_OUT.fetch_add(n as u64, Relaxed);
+                stats.packets_out.fetch_add(1, Relaxed);
+                stats.bytes_out.fetch_add(n as u64, Relaxed);
                 if public.send_to(&buf[..n], client).await.is_err() {
                     SEND_ERRORS.fetch_add(1, Relaxed);
                 }
@@ -199,18 +231,20 @@ async fn reply_loop(up: Arc<UdpSocket>, public: Arc<UdpSocket>, client: SocketAd
     }
     dead.store(true, Relaxed);
     ACTIVE.fetch_sub(1, Relaxed);
+    stats.active.fetch_sub(1, Relaxed);
     debug!(client = %client, %backend, "flow closed (idle)");
 }
 
-async fn serve_metrics(addr: SocketAddr) -> Result<()> {
+async fn serve_metrics(addr: SocketAddr, backends: Arc<Vec<(String, Arc<Stats>)>>) -> Result<()> {
     let l = TcpListener::bind(addr).await.with_context(|| format!("metrics bind {addr}"))?;
     info!(%addr, "metrics listening");
     loop {
         let Ok((mut s, _)) = l.accept().await else { continue };
+        let backends = backends.clone();
         tokio::spawn(async move {
             let mut b = [0u8; 1024];
             let _ = tokio::time::timeout(Duration::from_secs(2), s.read(&mut b)).await;
-            let body = render_metrics(ACTIVE.load(Relaxed));
+            let body = render_metrics(ACTIVE.load(Relaxed), &backends);
             let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             let _ = s.write_all(resp.as_bytes()).await;
         });
@@ -255,16 +289,18 @@ async fn main() -> Result<()> {
 
     let public = Arc::new(UdpSocket::bind(cfg.listen).await.with_context(|| format!("bind {}", cfg.listen))?);
     info!(listen = %cfg.listen, backends = cfg.backends.len(), "seki started");
+    let backends: Vec<Backend> = cfg.backends.iter().map(|b| Backend { name: b.name.clone(), addr: b.address, routable: b.server_id.is_some(), stats: Arc::default() }).collect();
     if let Some(m) = cfg.metrics {
+        let stats = Arc::new(backends.iter().map(|b| (b.name.clone(), b.stats.clone())).collect());
         tokio::spawn(async move {
-            if let Err(e) = serve_metrics(m).await {
+            if let Err(e) = serve_metrics(m, stats).await {
                 warn!("metrics: {e:#}");
             }
         });
     }
     let mut r = Router {
         public: public.clone(),
-        backends: cfg.backends.iter().map(|b| Backend { name: b.name.clone(), addr: b.address, routable: b.server_id.is_some() }).collect(),
+        backends,
         sni_exact,
         sni_wild,
         default: idx(&cfg.default),
