@@ -1,0 +1,25 @@
+# Seki: QUIC-aware UDP 443 router.
+listen: "[::]:443"            # dual-stack; use 0.0.0.0:443 for v4 only
+metrics: 127.0.0.1:9443       # Prometheus text at http://127.0.0.1:9443/ (null to disable)
+log_json: true
+
+# QUIC-LB routable CID scheme; must match the cooperating backends exactly.
+cid:
+  config_id: 0                # 0..6
+  server_id_len: 2            # bytes
+  nonce_len: 8                # bytes -> CID length 1+2+8 = 11
+  key_file: /etc/seki/cid.key # 32 hex chars (or `key: <hex>` inline)
+
+backends:
+  - { name: app,         address: "127.0.0.1:8443", server_id: 1 }   # routable CIDs
+  - { name: legacy,      address: "127.0.0.1:9443" }                 # plain flow table
+  - { name: other,       address: "127.0.0.1:10443" }
+
+sni:
+  "app.example.com": app
+  "*.legacy.example.com": legacy
+
+default: other                # unmatched SNI, unknown labels, non-QUIC
+
+flow_timeout: 60              # s, idle timeout for plain backends
+connection_timeout: 300       # s, idle timeout for routable backends

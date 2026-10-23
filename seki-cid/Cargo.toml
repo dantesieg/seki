@@ -1,0 +1,11 @@
+[package]
+name = "seki-cid"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Routable QUIC connection IDs (QUIC-LB style) shared by the seki router and its backends"
+
+[dependencies]
+aes = "0.9.3"
+hmac = "0.13.0"
+sha2 = "0.11.1"
