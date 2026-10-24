@@ -5,7 +5,8 @@ use anyhow::{Context, Result};
 use initial::CryptoBuf;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::io::ErrorKind::WouldBlock;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,7 +14,9 @@ use tokio::net::{TcpListener, UdpSocket};
 use tracing::{debug, info, warn};
 
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-fn now() -> u64 { START.elapsed().as_secs() }
+/// Coarse clock (seconds since start), refreshed by the reaper tick.
+static NOW: AtomicU64 = AtomicU64::new(0);
+fn now() -> u64 { NOW.load(Relaxed) }
 
 macro_rules! metrics {
     ($($name:ident),*) => {
@@ -63,7 +66,8 @@ struct Flow {
     up: Arc<UdpSocket>,
     stats: Arc<Stats>,
     last: Arc<AtomicU64>,
-    dead: Arc<AtomicBool>,
+    idle: u64,
+    task: tokio::task::JoinHandle<()>,
 }
 
 struct Pending {
@@ -112,15 +116,12 @@ impl Router {
 
     async fn handle(&mut self, src: SocketAddr, pkt: &[u8]) {
         if let Some(f) = self.flows.get(&src) {
-            if !f.dead.load(Relaxed) {
-                f.last.store(now(), Relaxed);
-                f.stats.add_in(pkt.len());
-                if f.up.send(pkt).await.is_err() {
-                    SEND_ERRORS.fetch_add(1, Relaxed);
-                }
-                return;
+            f.last.store(now(), Relaxed);
+            f.stats.add_in(pkt.len());
+            if send_up(&f.up, pkt).await.is_err() {
+                SEND_ERRORS.fetch_add(1, Relaxed);
             }
-            self.flows.remove(&src);
+            return;
         }
         if let Some(p) = self.pending.get_mut(&src) {
             p.pkts.push(pkt.to_vec());
@@ -185,21 +186,32 @@ impl Router {
         }
         let idle = if b.routable { self.conn_timeout } else { self.flow_timeout };
         let stats = b.stats.clone();
-        let flow = Flow { up: up.clone(), stats: stats.clone(), last: Arc::new(AtomicU64::new(now())), dead: Arc::new(AtomicBool::new(false)) };
         for p in &pkts {
             stats.add_in(p.len());
-            if up.send(p).await.is_err() {
+            if send_up(&up, p).await.is_err() {
                 SEND_ERRORS.fetch_add(1, Relaxed);
             }
         }
         ACTIVE.fetch_add(1, Relaxed);
         stats.active.fetch_add(1, Relaxed);
-        tokio::spawn(reply_loop(up, stats, self.public.clone(), src, flow.last.clone(), flow.dead.clone(), idle, b.name.clone()));
-        self.flows.insert(src, flow);
+        let last = Arc::new(AtomicU64::new(now()));
+        let task = tokio::spawn(reply_loop(up.clone(), stats.clone(), self.public.clone(), src, last.clone()));
+        self.flows.insert(src, Flow { up, stats, last, idle, task });
     }
 
     async fn tick(&mut self) {
-        self.flows.retain(|_, f| !f.dead.load(Relaxed));
+        NOW.store(START.elapsed().as_secs(), Relaxed);
+        let t = now();
+        self.flows.retain(|src, f| {
+            if t.saturating_sub(f.last.load(Relaxed)) < f.idle {
+                return true;
+            }
+            f.task.abort();
+            ACTIVE.fetch_sub(1, Relaxed);
+            f.stats.active.fetch_sub(1, Relaxed);
+            debug!(client = %src, "flow closed (idle)");
+            false
+        });
         let expired: Vec<_> = self.pending.iter().filter(|(_, p)| p.since.elapsed() > PENDING_TIMEOUT).map(|(a, _)| *a).collect();
         for a in expired {
             self.try_decide(a, true).await;
@@ -207,32 +219,40 @@ impl Router {
     }
 }
 
-async fn reply_loop(up: Arc<UdpSocket>, stats: Arc<Stats>, public: Arc<UdpSocket>, client: SocketAddr, last: Arc<AtomicU64>, dead: Arc<AtomicBool>, idle: u64, backend: String) {
+async fn send_up(up: &UdpSocket, pkt: &[u8]) -> std::io::Result<usize> {
+    match up.try_send(pkt) {
+        Err(e) if e.kind() == WouldBlock => up.send(pkt).await,
+        r => r,
+    }
+}
+
+/// Backend→client relay; drains the socket per wakeup. Aborted by the reaper when idle.
+async fn reply_loop(up: Arc<UdpSocket>, stats: Arc<Stats>, public: Arc<UdpSocket>, client: SocketAddr, last: Arc<AtomicU64>) {
     let mut buf = vec![0u8; 65535];
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), up.recv(&mut buf)).await {
-            Ok(Ok(n)) => {
-                last.store(now(), Relaxed);
-                PACKETS_OUT.fetch_add(1, Relaxed);
-                BYTES_OUT.fetch_add(n as u64, Relaxed);
-                stats.packets_out.fetch_add(1, Relaxed);
-                stats.bytes_out.fetch_add(n as u64, Relaxed);
-                if public.send_to(&buf[..n], client).await.is_err() {
-                    SEND_ERRORS.fetch_add(1, Relaxed);
-                }
-            }
-            Ok(Err(_)) => {} // ICMP unreachable etc.; keep going until idle
-            Err(_) => {
-                if now().saturating_sub(last.load(Relaxed)) >= idle {
-                    break;
-                }
+        if up.readable().await.is_err() {
+            return;
+        }
+        loop {
+            let n = match up.try_recv(&mut buf) {
+                Ok(n) => n,
+                Err(e) if e.kind() == WouldBlock => break,
+                Err(_) => continue, // ICMP unreachable etc.; idle reaper decides
+            };
+            last.store(now(), Relaxed);
+            PACKETS_OUT.fetch_add(1, Relaxed);
+            BYTES_OUT.fetch_add(n as u64, Relaxed);
+            stats.packets_out.fetch_add(1, Relaxed);
+            stats.bytes_out.fetch_add(n as u64, Relaxed);
+            let res = match public.try_send_to(&buf[..n], client) {
+                Err(e) if e.kind() == WouldBlock => public.send_to(&buf[..n], client).await,
+                r => r,
+            };
+            if res.is_err() {
+                SEND_ERRORS.fetch_add(1, Relaxed);
             }
         }
     }
-    dead.store(true, Relaxed);
-    ACTIVE.fetch_sub(1, Relaxed);
-    stats.active.fetch_sub(1, Relaxed);
-    debug!(client = %client, %backend, "flow closed (idle)");
 }
 
 /// Set DF and never fragment locally (IP_PMTUDISC_PROBE), so QUIC PMTUD
@@ -270,7 +290,7 @@ async fn serve_metrics(addr: SocketAddr, backends: Arc<Vec<(String, Arc<Stats>)>
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let path = std::env::args().nth(1).unwrap_or_else(|| "seki.yaml".into());
     if path == "-h" || path == "--help" {
@@ -285,6 +305,7 @@ async fn main() -> Result<()> {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
     LazyLock::force(&START);
+    let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     let cid = cfg.cid_config()?;
     let idx = |n: &str| cfg.backends.iter().position(|b| b.name == n).unwrap();
@@ -336,17 +357,26 @@ async fn main() -> Result<()> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
-            res = public.recv_from(&mut buf) => match res {
-                Ok((n, src)) if n > 0 => {
-                    PACKETS_IN.fetch_add(1, Relaxed);
-                    BYTES_IN.fetch_add(n as u64, Relaxed);
-                    r.handle(src, &buf[..n]).await;
+            res = public.readable() => {
+                if let Err(e) = res {
+                    debug!("readable: {e}");
+                    continue;
                 }
-                Ok(_) => {}
-                Err(e) => debug!("recv: {e}"),
+                loop {
+                    match public.try_recv_from(&mut buf) {
+                        Ok((n, src)) if n > 0 => {
+                            PACKETS_IN.fetch_add(1, Relaxed);
+                            BYTES_IN.fetch_add(n as u64, Relaxed);
+                            r.handle(src, &buf[..n]).await;
+                        }
+                        Ok(_) => {}
+                        Err(e) if e.kind() == WouldBlock => break,
+                        Err(e) => debug!("recv: {e}"),
+                    }
+                }
             },
             _ = tick.tick() => r.tick().await,
-            _ = tokio::signal::ctrl_c() => break,
+            _ = int.recv() => break,
             _ = term.recv() => break,
         }
     }
