@@ -44,17 +44,17 @@ fn ruleset(port: u16, timeout: u64, backends: &[Option<SocketAddrV4>]) -> String
   set flowkeys {{ type ipv4_addr . inet_service; flags dynamic, timeout; timeout {timeout}s; size 262144; }}
   map flowmap {{ type ipv4_addr . inet_service : ipv4_addr . inet_service; size 262144; }}
   chain raw_pre {{ type filter hook prerouting priority raw; policy accept;
-    udp dport {port} fib daddr type local ip saddr . udp sport @flowkeys update @flowkeys {{ ip saddr . udp sport }} accept
-    udp dport {port} fib daddr type local notrack
+    udp dport {port} fib daddr type local ip saddr . udp sport @flowkeys update @flowkeys {{ ip saddr . udp sport }} counter accept
+    udp dport {port} fib daddr type local counter notrack
   }}
   chain raw_out {{ type filter hook output priority raw; policy accept;
-    meta mark != {MARK} udp sport {port} notrack
+    meta mark != {MARK} udp sport {port} counter notrack
   }}
   chain nat_pre {{ type nat hook prerouting priority dstnat; policy accept;
-    udp dport {port} fib daddr type local dnat ip to ip saddr . udp sport map @flowmap
+    udp dport {port} fib daddr type local counter dnat ip to ip saddr . udp sport map @flowmap
   }}
   chain nat_out {{ type nat hook output priority -100; policy accept;
-    meta mark {MARK} udp dport {port} dnat ip to ip saddr . udp sport map @flowmap
+    udp dport {port} fib daddr type local counter dnat ip to ip saddr . udp sport map @flowmap
   }}
 "
     );
@@ -65,7 +65,8 @@ fn ruleset(port: u16, timeout: u64, backends: &[Option<SocketAddrV4>]) -> String
         cin += &format!("    ct status dnat ip daddr {} udp dport {} counter name in_{i}\n", b.ip(), b.port());
         cout += &format!("    ct status dnat ip saddr {} udp sport {} counter name out_{i}\n", b.ip(), b.port());
     }
-    s += &format!("  chain cnt_in {{ type filter hook input priority filter; policy accept;\n    iifname != \"lo\" ip daddr 127.0.0.0/8 ct status & dnat == 0 drop\n{cin}  }}\n");
+    // injected packets that missed DNAT would loop back into Seki: drop them
+    s += &format!("  chain cnt_in {{ type filter hook input priority filter; policy accept;\n    meta mark {MARK} udp dport {port} counter drop\n    iifname != \"lo\" ip daddr 127.0.0.0/8 ct status & dnat == 0 drop\n{cin}  }}\n");
     s += &format!("  chain cnt_out {{ type filter hook output priority filter; policy accept;\n{cout}  }}\n}}\n");
     s
 }

@@ -83,10 +83,13 @@ struct Pending {
 enum Fast {
     /// nft add in flight; packets buffered for injection.
     Adding { bi: usize, pkts: Vec<Vec<u8>> },
-    Active { bi: usize, added: Instant },
+    Active { bi: usize, added: Instant, hits: u32 },
 }
 
-const MAX_FAST_BUF: usize = 64;
+const MAX_FAST_BUF: usize = 512;
+/// Packets reaching Seki for an already-added tuple before it falls back to the relay
+/// (the kernel is evidently not taking over).
+const MAX_FAST_HITS: u32 = 1024;
 /// After this long, a packet reaching Seki for an active tuple means its key expired: re-add.
 const READD_AFTER: Duration = Duration::from_secs(2);
 
@@ -110,6 +113,7 @@ struct Router {
     pending: HashMap<SocketAddr, Pending>,
     fp: Option<fastpath::Fastpath>,
     fast: HashMap<SocketAddrV4, Fast>,
+    readd_hits: HashMap<SocketAddrV4, u32>,
     ticks: u64,
 }
 
@@ -141,14 +145,27 @@ impl Router {
                         pkts.push(pkt.to_vec());
                     }
                 }
-                Fast::Active { added, .. } if added.elapsed() < READD_AFTER => self.inject(v4, &[pkt.to_vec()]),
-                Fast::Active { bi, .. } => {
+                Fast::Active { bi, hits, .. } if *hits >= MAX_FAST_HITS => {
+                    let bi = *bi;
+                    self.fast.remove(&v4);
+                    FASTPATH_FALLBACKS.fetch_add(1, Relaxed);
+                    warn!(client = %v4, backend = %self.backends[bi].name, "fastpath not taking over; using relay for this flow");
+                    return self.relay(src, bi, vec![pkt.to_vec()]).await;
+                }
+                Fast::Active { added, hits, .. } if added.elapsed() < READD_AFTER => {
+                    *hits += 1;
+                    self.inject(v4, &[pkt.to_vec()]);
+                }
+                Fast::Active { bi, hits, .. } => {
+                    *hits += 1;
                     // key expired while the client was idle: re-add to the same backend
                     let bi = *bi;
                     if let (Some(fp), SocketAddr::V4(ba)) = (&self.fp, self.backends[bi].addr) {
                         let _ = fp.tx.send(fastpath::Op::Add(vec![(v4, ba)]));
                     }
+                    let hits = *hits;
                     *f = Fast::Adding { bi, pkts: vec![pkt.to_vec()] };
+                    self.readd_hits.insert(v4, hits);
                 }
             }
             return;
@@ -245,9 +262,11 @@ impl Router {
                             self.backends[bi].stats.add_in(p.len());
                         }
                         self.inject(k, &pkts);
-                        self.fast.insert(k, Fast::Active { bi, added: Instant::now() });
+                        let hits = self.readd_hits.remove(&k).unwrap_or(0);
+                        self.fast.insert(k, Fast::Active { bi, added: Instant::now(), hits });
                     } else {
                         FASTPATH_FALLBACKS.fetch_add(1, Relaxed);
+                        self.readd_hits.remove(&k);
                         self.relay(SocketAddr::V4(k), bi, pkts).await;
                     }
                 }
@@ -465,6 +484,7 @@ async fn main() -> Result<()> {
         pending: HashMap::new(),
         fp,
         fast: HashMap::new(),
+        readd_hits: HashMap::new(),
         ticks: 0,
     };
     let mut buf = vec![0u8; 65535];
