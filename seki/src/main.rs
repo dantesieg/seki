@@ -235,6 +235,25 @@ async fn reply_loop(up: Arc<UdpSocket>, stats: Arc<Stats>, public: Arc<UdpSocket
     debug!(client = %client, %backend, "flow closed (idle)");
 }
 
+/// Set DF and never fragment locally (IP_PMTUDISC_PROBE), so QUIC PMTUD
+/// probes forwarded to clients are passed or dropped intact.
+#[cfg(target_os = "linux")]
+fn set_pmtudisc_probe(s: &UdpSocket, v6: bool) {
+    use std::os::fd::AsRawFd;
+    let set = |level, opt, val: libc::c_int| unsafe {
+        libc::setsockopt(s.as_raw_fd(), level, opt, &val as *const _ as *const libc::c_void, size_of::<libc::c_int>() as libc::socklen_t) == 0
+    };
+    // On a dual-stack v6 socket, IP_MTU_DISCOVER covers v4-mapped traffic.
+    let v4 = set(libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, libc::IP_PMTUDISC_PROBE);
+    let v6ok = !v6 || set(libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER, libc::IPV6_PMTUDISC_PROBE);
+    if !(v6ok && (v4 || v6)) {
+        warn!("setting PMTUDISC_PROBE failed: {}", std::io::Error::last_os_error());
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_pmtudisc_probe(_: &UdpSocket, _: bool) {}
+
 async fn serve_metrics(addr: SocketAddr, backends: Arc<Vec<(String, Arc<Stats>)>>) -> Result<()> {
     let l = TcpListener::bind(addr).await.with_context(|| format!("metrics bind {addr}"))?;
     info!(%addr, "metrics listening");
@@ -288,6 +307,7 @@ async fn main() -> Result<()> {
     sni_wild.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
 
     let public = Arc::new(UdpSocket::bind(cfg.listen).await.with_context(|| format!("bind {}", cfg.listen))?);
+    set_pmtudisc_probe(&public, cfg.listen.is_ipv6());
     info!(listen = %cfg.listen, backends = cfg.backends.len(), "seki started");
     let backends: Vec<Backend> = cfg.backends.iter().map(|b| Backend { name: b.name.clone(), addr: b.address, routable: b.server_id.is_some(), stats: Arc::default() }).collect();
     if let Some(m) = cfg.metrics {

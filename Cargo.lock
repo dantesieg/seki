@@ -384,6 +384,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "hkdf",
+ "libc",
  "seki-cid",
  "serde",
  "serde_yaml_ng",
