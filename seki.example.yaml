@@ -23,3 +23,13 @@ default: other                # unmatched SNI, unknown labels, non-QUIC
 
 flow_timeout: 60              # s, idle timeout for plain backends
 connection_timeout: 300       # s, idle timeout for routable backends
+
+# Kernel fast path: after Seki decides a client ip:port, nftables DNAT +
+# conntrack forward the rest of the flow (Seki only sees new tuples:
+# Initials, migrations, rebinds). IPv4 only; IPv6 clients use the relay.
+# Backends then see real client IPs. Remove or set enabled: false for the
+# userspace relay. See README "Fast path" for host prerequisites.
+fastpath:
+  enabled: true
+  # public_ip: 203.0.113.10   # default: listen IP, else default-route source
+  # nft: /usr/sbin/nft

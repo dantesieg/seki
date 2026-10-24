@@ -1,10 +1,11 @@
 mod config;
+mod fastpath;
 mod initial;
 
 use anyhow::{Context, Result};
 use initial::CryptoBuf;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::io::ErrorKind::WouldBlock;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock};
@@ -26,7 +27,7 @@ macro_rules! metrics {
             $(s += &format!("seki_{} {}\n", stringify!($name).to_ascii_lowercase(), $name.load(Relaxed));)*
             s += &format!("seki_flows_active {active}\n");
             for (n, st) in backends {
-                for (m, v) in [("packets_in", &st.packets_in), ("bytes_in", &st.bytes_in), ("packets_out", &st.packets_out), ("bytes_out", &st.bytes_out), ("migrations", &st.migrations), ("flows_active", &st.active)] {
+                for (m, v) in [("packets_in", &st.packets_in), ("bytes_in", &st.bytes_in), ("packets_out", &st.packets_out), ("bytes_out", &st.bytes_out), ("migrations", &st.migrations), ("flows_active", &st.active), ("fastpath_flows", &st.fast_flows), ("fastpath_packets_in", &st.fast[0]), ("fastpath_bytes_in", &st.fast[1]), ("fastpath_packets_out", &st.fast[2]), ("fastpath_bytes_out", &st.fast[3])] {
                     s += &format!("seki_backend_{m}{{backend=\"{n}\"}} {}\n", v.load(Relaxed));
                 }
             }
@@ -34,7 +35,7 @@ macro_rules! metrics {
         }
     };
 }
-metrics!(PACKETS_IN, BYTES_IN, PACKETS_OUT, BYTES_OUT, FLOWS_SNI, FLOWS_CID, FLOWS_FALLBACK, MIGRATIONS, SEND_ERRORS);
+metrics!(PACKETS_IN, BYTES_IN, PACKETS_OUT, BYTES_OUT, FLOWS_SNI, FLOWS_CID, FLOWS_FALLBACK, MIGRATIONS, SEND_ERRORS, FASTPATH_FLOWS, FASTPATH_FALLBACKS, FASTPATH_INJECTED, FASTPATH_INJECT_ERRORS, FASTPATH_ACTIVE);
 static ACTIVE: AtomicU64 = AtomicU64::new(0);
 
 /// Per-backend counters; in = client→backend, out = backend→client.
@@ -46,6 +47,9 @@ struct Stats {
     bytes_out: AtomicU64,
     migrations: AtomicU64,
     active: AtomicU64,
+    fast_flows: AtomicU64,
+    /// nft counters: packets_in, bytes_in, packets_out, bytes_out.
+    fast: [AtomicU64; 4],
 }
 
 impl Stats {
@@ -76,6 +80,16 @@ struct Pending {
     since: Instant,
 }
 
+enum Fast {
+    /// nft add in flight; packets buffered for injection.
+    Adding { bi: usize, pkts: Vec<Vec<u8>> },
+    Active { bi: usize, added: Instant },
+}
+
+const MAX_FAST_BUF: usize = 64;
+/// After this long, a packet reaching Seki for an active tuple means its key expired: re-add.
+const READD_AFTER: Duration = Duration::from_secs(2);
+
 enum Reason {
     Sni(Option<String>),
     Cid(u64),
@@ -94,6 +108,9 @@ struct Router {
     conn_timeout: u64,
     flows: HashMap<SocketAddr, Flow>,
     pending: HashMap<SocketAddr, Pending>,
+    fp: Option<fastpath::Fastpath>,
+    fast: HashMap<SocketAddrV4, Fast>,
+    ticks: u64,
 }
 
 const MAX_PENDING_PKTS: usize = 6;
@@ -115,6 +132,27 @@ impl Router {
     }
 
     async fn handle(&mut self, src: SocketAddr, pkt: &[u8]) {
+        if let SocketAddr::V4(v4) = src
+            && let Some(f) = self.fast.get_mut(&v4)
+        {
+            match f {
+                Fast::Adding { pkts, .. } => {
+                    if pkts.len() < MAX_FAST_BUF {
+                        pkts.push(pkt.to_vec());
+                    }
+                }
+                Fast::Active { added, .. } if added.elapsed() < READD_AFTER => self.inject(v4, &[pkt.to_vec()]),
+                Fast::Active { bi, .. } => {
+                    // key expired while the client was idle: re-add to the same backend
+                    let bi = *bi;
+                    if let (Some(fp), SocketAddr::V4(ba)) = (&self.fp, self.backends[bi].addr) {
+                        let _ = fp.tx.send(fastpath::Op::Add(vec![(v4, ba)]));
+                    }
+                    *f = Fast::Adding { bi, pkts: vec![pkt.to_vec()] };
+                }
+            }
+            return;
+        }
         if let Some(f) = self.flows.get(&src) {
             f.last.store(now(), Relaxed);
             f.stats.add_in(pkt.len());
@@ -170,6 +208,68 @@ impl Router {
 
     async fn open(&mut self, src: SocketAddr, bi: usize, reason: Reason, pkts: Vec<Vec<u8>>) {
         let b = &self.backends[bi];
+        let client = src.ip().to_string();
+        match &reason {
+            Reason::Sni(s) => { FLOWS_SNI.fetch_add(1, Relaxed); info!(%client, port = src.port(), backend = %b.name, sni = s.as_deref().unwrap_or("-"), "new connection") }
+            Reason::Cid(sid) => { FLOWS_CID.fetch_add(1, Relaxed); info!(%client, port = src.port(), backend = %b.name, server_id = sid, "migrated connection (routed by cid)") }
+            Reason::Fallback => { FLOWS_FALLBACK.fetch_add(1, Relaxed); debug!(%client, port = src.port(), backend = %b.name, "fallback flow") }
+        }
+        if let (Some(fp), SocketAddr::V4(c), SocketAddr::V4(ba)) = (&self.fp, src, b.addr) {
+            let _ = fp.tx.send(fastpath::Op::Add(vec![(c, ba)]));
+            self.fast.insert(c, Fast::Adding { bi, pkts });
+            return;
+        }
+        self.relay(src, bi, pkts).await;
+    }
+
+    fn inject(&self, src: SocketAddrV4, pkts: &[Vec<u8>]) {
+        let Some(fp) = &self.fp else { return };
+        match fp.inject(src, pkts) {
+            Ok(()) => { FASTPATH_INJECTED.fetch_add(pkts.len() as u64, Relaxed); }
+            Err(e) => {
+                FASTPATH_INJECT_ERRORS.fetch_add(1, Relaxed);
+                debug!(client = %src, "fastpath inject: {e}");
+            }
+        }
+    }
+
+    async fn fast_event(&mut self, ev: fastpath::Event) {
+        match ev {
+            fastpath::Event::Added(res) => {
+                for (k, ok) in res {
+                    let Some(Fast::Adding { bi, pkts }) = self.fast.remove(&k) else { continue };
+                    if ok {
+                        FASTPATH_FLOWS.fetch_add(1, Relaxed);
+                        self.backends[bi].stats.fast_flows.fetch_add(1, Relaxed);
+                        for p in &pkts {
+                            self.backends[bi].stats.add_in(p.len());
+                        }
+                        self.inject(k, &pkts);
+                        self.fast.insert(k, Fast::Active { bi, added: Instant::now() });
+                    } else {
+                        FASTPATH_FALLBACKS.fetch_add(1, Relaxed);
+                        self.relay(SocketAddr::V4(k), bi, pkts).await;
+                    }
+                }
+            }
+            fastpath::Event::Gc(gone, counters) => {
+                for k in gone {
+                    if matches!(self.fast.get(&k), Some(Fast::Active { .. })) {
+                        self.fast.remove(&k);
+                    }
+                }
+                for (b, c) in self.backends.iter().zip(counters) {
+                    for (a, v) in b.stats.fast.iter().zip(c) {
+                        a.store(v, Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Userspace relay: one upstream socket per client address.
+    async fn relay(&mut self, src: SocketAddr, bi: usize, pkts: Vec<Vec<u8>>) {
+        let b = &self.backends[bi];
         let bind: SocketAddr = if b.addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().unwrap();
         let up = match UdpSocket::bind(bind).await {
             Ok(s) if s.connect(b.addr).await.is_ok() => Arc::new(s),
@@ -178,12 +278,6 @@ impl Router {
                 return;
             }
         };
-        let client = src.ip().to_string();
-        match &reason {
-            Reason::Sni(s) => { FLOWS_SNI.fetch_add(1, Relaxed); info!(%client, port = src.port(), backend = %b.name, sni = s.as_deref().unwrap_or("-"), "new connection") }
-            Reason::Cid(sid) => { FLOWS_CID.fetch_add(1, Relaxed); info!(%client, port = src.port(), backend = %b.name, server_id = sid, "migrated connection (routed by cid)") }
-            Reason::Fallback => { FLOWS_FALLBACK.fetch_add(1, Relaxed); debug!(%client, port = src.port(), backend = %b.name, "fallback flow") }
-        }
         let idle = if b.routable { self.conn_timeout } else { self.flow_timeout };
         let stats = b.stats.clone();
         for p in &pkts {
@@ -201,6 +295,14 @@ impl Router {
 
     async fn tick(&mut self) {
         NOW.store(START.elapsed().as_secs(), Relaxed);
+        self.ticks += 1;
+        FASTPATH_ACTIVE.store(self.fast.len() as u64, Relaxed);
+        if let Some(fp) = &self.fp
+            && self.ticks % 30 == 0
+        {
+            let known = self.fast.iter().filter(|(_, f)| matches!(f, Fast::Active { .. })).map(|(k, _)| *k).collect();
+            let _ = fp.tx.send(fastpath::Op::Gc(known));
+        }
         let t = now();
         self.flows.retain(|src, f| {
             if t.saturating_sub(f.last.load(Relaxed)) < f.idle {
@@ -330,6 +432,16 @@ async fn main() -> Result<()> {
     let public = Arc::new(UdpSocket::bind(cfg.listen).await.with_context(|| format!("bind {}", cfg.listen))?);
     set_pmtudisc_probe(&public, cfg.listen.is_ipv6());
     info!(listen = %cfg.listen, backends = cfg.backends.len(), "seki started");
+    let (fp, mut fp_rx) = match &cfg.fastpath {
+        Some(f) if f.enabled => {
+            let addrs: Vec<_> = cfg.backends.iter().map(|b| match b.address { SocketAddr::V4(a) => Some(a), _ => None }).collect();
+            let timeout = cfg.connection_timeout.max(cfg.flow_timeout);
+            let (fp, rx) = fastpath::Fastpath::start(f.nft.clone(), f.public_ip, cfg.listen, timeout, &addrs)?;
+            info!(public = %fp.public, timeout, "fastpath enabled (nft table ip seki)");
+            (Some(fp), Some(rx))
+        }
+        _ => (None, None),
+    };
     let backends: Vec<Backend> = cfg.backends.iter().map(|b| Backend { name: b.name.clone(), addr: b.address, routable: b.server_id.is_some(), stats: Arc::default() }).collect();
     if let Some(m) = cfg.metrics {
         let stats = Arc::new(backends.iter().map(|b| (b.name.clone(), b.stats.clone())).collect());
@@ -351,6 +463,9 @@ async fn main() -> Result<()> {
         conn_timeout: cfg.connection_timeout,
         flows: HashMap::new(),
         pending: HashMap::new(),
+        fp,
+        fast: HashMap::new(),
+        ticks: 0,
     };
     let mut buf = vec![0u8; 65535];
     let mut tick = tokio::time::interval(Duration::from_millis(500));
@@ -375,11 +490,15 @@ async fn main() -> Result<()> {
                     }
                 }
             },
+            Some(ev) = async { match &mut fp_rx { Some(rx) => rx.recv().await, None => std::future::pending().await } } => r.fast_event(ev).await,
             _ = tick.tick() => r.tick().await,
             _ = int.recv() => break,
             _ = term.recv() => break,
         }
     }
     info!("seki stopping");
+    if let Some(fp) = &r.fp {
+        fp.stop();
+    }
     Ok(())
 }

@@ -25,7 +25,23 @@ pub struct Config {
     pub connection_timeout: u64,
     #[serde(default)]
     pub log_json: bool,
+    /// Kernel fast path (nftables DNAT + conntrack) for decided flows.
+    pub fastpath: Option<FastpathConfig>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FastpathConfig {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Public IPv4 that clients send to; autodetected from the default route if unset.
+    pub public_ip: Option<std::net::Ipv4Addr>,
+    #[serde(default = "nft_bin")]
+    pub nft: String,
+}
+
+fn yes() -> bool { true }
+fn nft_bin() -> String { "nft".into() }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
