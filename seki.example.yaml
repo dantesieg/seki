@@ -19,6 +19,12 @@ sni:
   "app.example.com": app
   "*.legacy.example.com": legacy
 
+# Probe resistance: Initials with a valid mark (seki_cid::mark) in the DCID go to
+# `backend`; unmarked ones follow `sni` above (point that SNI at a real HTTP/3 site).
+# mark:
+#   key_file: /etc/seki/mark.key   # 32 hex chars, different from cid.key
+#   backend: app
+
 default: other                # unmatched SNI, unknown labels, non-QUIC
 
 flow_timeout: 60              # s, idle timeout for plain backends

@@ -35,7 +35,7 @@ macro_rules! metrics {
         }
     };
 }
-metrics!(PACKETS_IN, BYTES_IN, PACKETS_OUT, BYTES_OUT, FLOWS_SNI, FLOWS_CID, FLOWS_FALLBACK, MIGRATIONS, SEND_ERRORS, FASTPATH_FLOWS, FASTPATH_FALLBACKS, FASTPATH_INJECTED, FASTPATH_INJECT_ERRORS, FASTPATH_ACTIVE);
+metrics!(PACKETS_IN, BYTES_IN, PACKETS_OUT, BYTES_OUT, FLOWS_SNI, FLOWS_CID, FLOWS_FALLBACK, FLOWS_MARK, MARK_REPLAYS, MIGRATIONS, SEND_ERRORS, FASTPATH_FLOWS, FASTPATH_FALLBACKS, FASTPATH_INJECTED, FASTPATH_INJECT_ERRORS, FASTPATH_ACTIVE);
 static ACTIVE: AtomicU64 = AtomicU64::new(0);
 
 /// Per-backend counters; in = client→backend, out = backend→client.
@@ -96,6 +96,7 @@ const READD_AFTER: Duration = Duration::from_secs(2);
 enum Reason {
     Sni(Option<String>),
     Cid(u64),
+    Mark,
     Fallback,
 }
 
@@ -106,6 +107,10 @@ struct Router {
     sni_wild: Vec<(String, usize)>,
     default: usize,
     cid: Option<seki_cid::Config>,
+    /// Mark key and the backend marked Initials go to.
+    mark: Option<(seki_cid::mark::MarkKey, usize)>,
+    /// Accepted mark DCIDs -> (client, unix secs), for replay detection.
+    marks_seen: HashMap<Vec<u8>, (SocketAddr, u64)>,
     by_sid: HashMap<u64, usize>,
     flow_timeout: u64,
     conn_timeout: u64,
@@ -120,6 +125,11 @@ struct Router {
 const MAX_PENDING_PKTS: usize = 6;
 const PENDING_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_PENDING_ADDRS: usize = 4096;
+const MAX_MARKS: usize = 65536;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
 
 impl Router {
     fn route_sni(&self, sni: Option<&str>) -> usize {
@@ -133,6 +143,33 @@ impl Router {
     fn route_cid(&self, dcid: &[u8]) -> Option<(usize, u64)> {
         let sid = self.cid.as_ref()?.decode_u64(dcid).ok()?;
         self.by_sid.get(&sid).map(|&i| (i, sid))
+    }
+
+    /// Backend for an Initial whose DCID carries a fresh, valid mark.
+    /// A mark already accepted from another client address is a replay: None.
+    fn route_mark(&mut self, src: SocketAddr, dcid: &[u8]) -> Option<usize> {
+        let t = unix_now();
+        let bi = {
+            let (k, bi) = self.mark.as_ref()?;
+            if !k.check(dcid, t) {
+                return None;
+            }
+            *bi
+        };
+        match self.marks_seen.get(dcid) {
+            Some((s, _)) if *s != src => {
+                MARK_REPLAYS.fetch_add(1, Relaxed);
+                warn!(client = %src, first = %s, "replayed mark; routing as unmarked");
+                return None;
+            }
+            Some(_) => {}
+            None if self.marks_seen.len() >= MAX_MARKS => {
+                warn!(client = %src.ip(), "mark cache full; routing as unmarked");
+                return None;
+            }
+            None => { self.marks_seen.insert(dcid.to_vec(), (src, t)); }
+        }
+        Some(bi)
     }
 
     async fn handle(&mut self, src: SocketAddr, pkt: &[u8]) {
@@ -190,6 +227,9 @@ impl Router {
             }
             let version = u32::from_be_bytes(pkt[1..5].try_into().unwrap());
             if initial::is_initial(first, version) {
+                if let Some(bi) = pkt.get(6..6 + pkt[5] as usize).and_then(|d| self.route_mark(src, d)) {
+                    return self.open(src, bi, Reason::Mark, vec![pkt.to_vec()]).await;
+                }
                 if self.pending.len() >= MAX_PENDING_ADDRS {
                     return self.open(src, self.default, Reason::Fallback, vec![pkt.to_vec()]).await;
                 }
@@ -229,6 +269,7 @@ impl Router {
         match &reason {
             Reason::Sni(s) => { FLOWS_SNI.fetch_add(1, Relaxed); info!(%client, port = src.port(), backend = %b.name, sni = s.as_deref().unwrap_or("-"), "new connection") }
             Reason::Cid(sid) => { FLOWS_CID.fetch_add(1, Relaxed); info!(%client, port = src.port(), backend = %b.name, server_id = sid, "migrated connection (routed by cid)") }
+            Reason::Mark => { FLOWS_MARK.fetch_add(1, Relaxed); info!(%client, port = src.port(), backend = %b.name, "new connection (marked)") }
             Reason::Fallback => { FLOWS_FALLBACK.fetch_add(1, Relaxed); debug!(%client, port = src.port(), backend = %b.name, "fallback flow") }
         }
         if let (Some(fp), SocketAddr::V4(c), SocketAddr::V4(ba)) = (&self.fp, src, b.addr) {
@@ -317,10 +358,14 @@ impl Router {
         self.ticks += 1;
         FASTPATH_ACTIVE.store(self.fast.len() as u64, Relaxed);
         if let Some(fp) = &self.fp
-            && self.ticks % 30 == 0
+            && self.ticks.is_multiple_of(30)
         {
             let known = self.fast.iter().filter(|(_, f)| matches!(f, Fast::Active { .. })).map(|(k, _)| *k).collect();
             let _ = fp.tx.send(fastpath::Op::Gc(known));
+        }
+        if self.ticks.is_multiple_of(20) {
+            let ut = unix_now();
+            self.marks_seen.retain(|_, (_, s)| ut.saturating_sub(*s) < seki_cid::mark::REPLAY_WINDOW_SECS);
         }
         let t = now();
         self.flows.retain(|src, f| {
@@ -429,6 +474,7 @@ async fn main() -> Result<()> {
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     let cid = cfg.cid_config()?;
+    let mark = cfg.mark_key()?;
     let idx = |n: &str| cfg.backends.iter().position(|b| b.name == n).unwrap();
     let mut by_sid = HashMap::new();
     for (i, b) in cfg.backends.iter().enumerate() {
@@ -477,6 +523,8 @@ async fn main() -> Result<()> {
         sni_wild,
         default: idx(&cfg.default),
         cid,
+        mark: mark.map(|k| (k, idx(&cfg.mark.as_ref().unwrap().backend))),
+        marks_seen: HashMap::new(),
         by_sid,
         flow_timeout: cfg.flow_timeout,
         conn_timeout: cfg.connection_timeout,

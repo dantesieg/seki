@@ -27,6 +27,17 @@ pub struct Config {
     pub log_json: bool,
     /// Kernel fast path (nftables DNAT + conntrack) for decided flows.
     pub fastpath: Option<FastpathConfig>,
+    /// Initials whose DCID carries a valid seki-cid mark go to `backend`;
+    /// unmarked ones fall through to SNI routing (e.g. a real HTTP/3 site).
+    pub mark: Option<MarkConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarkConfig {
+    pub key: Option<String>,
+    pub key_file: Option<PathBuf>,
+    pub backend: String,
 }
 
 #[derive(Deserialize)]
@@ -80,20 +91,40 @@ impl Config {
                 bail!("sni {k:?} -> unknown backend {v:?}");
             }
         }
+        if let Some(m) = &c.mark
+            && !names.contains(&m.backend.as_str())
+        {
+            bail!("mark -> unknown backend {:?}", m.backend);
+        }
         if c.backends.iter().any(|b| b.server_id.is_some()) && c.cid.is_none() {
             bail!("backends have server_id but no cid section");
         }
         Ok(c)
     }
 
+    pub fn mark_key(&self) -> Result<Option<seki_cid::mark::MarkKey>> {
+        let Some(m) = &self.mark else { return Ok(None) };
+        let key = read_key("mark", &m.key, &m.key_file)?;
+        if let Some(c) = &self.cid
+            && read_key("cid", &c.key, &c.key_file)? == key
+        {
+            bail!("mark key must differ from the cid key");
+        }
+        Ok(Some(seki_cid::mark::MarkKey::new(&key)))
+    }
+
     pub fn cid_config(&self) -> Result<Option<seki_cid::Config>> {
         let Some(c) = &self.cid else { return Ok(None) };
-        let hex = match (&c.key, &c.key_file) {
-            (Some(k), None) => k.clone(),
-            (None, Some(f)) => std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?,
-            _ => bail!("cid: set exactly one of key / key_file"),
-        };
-        let key = seki_cid::parse_key_hex(&hex).map_err(|e| anyhow::anyhow!("cid key: {e} (need 32 hex chars)"))?;
+        let key = read_key("cid", &c.key, &c.key_file)?;
         Ok(Some(seki_cid::Config::new(c.config_id, c.server_id_len, c.nonce_len, &key).map_err(|e| anyhow::anyhow!("cid: {e}"))?))
     }
+}
+
+fn read_key(what: &str, key: &Option<String>, file: &Option<PathBuf>) -> Result<[u8; 16]> {
+    let hex = match (key, file) {
+        (Some(k), None) => k.clone(),
+        (None, Some(f)) => std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?,
+        _ => bail!("{what}: set exactly one of key / key_file"),
+    };
+    seki_cid::parse_key_hex(&hex).map_err(|e| anyhow::anyhow!("{what} key: {e} (need 32 hex chars)"))
 }

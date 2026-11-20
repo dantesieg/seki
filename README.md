@@ -2,6 +2,9 @@
 
 UDP 443 router for QUIC that keeps connection migration working.
 
+- Marked Initials (optional `mark`): if the client-chosen DCID carries a valid `seki_cid::mark` tag,
+  the connection goes to `mark.backend` without looking at the SNI. Unmarked Initials with the same SNI
+  follow the `sni` map, e.g. to a real HTTP/3 site, so probes only ever see that site.
 - New connections (client Initial): decrypts the Initial (QUIC v1/v2), reads the SNI, routes by `sni` map.
 - Packets from an unknown client address with a routable DCID (`seki-cid`): routed to the backend
   by server id, so Wi-Fi to mobile switches and NAT rebinding reach the same backend. Each client
@@ -18,6 +21,14 @@ Run: `seki /etc/seki/seki.yaml`, log level via `SEKI_LOG` (default `info`). Conf
 CID = `[config_id:3 | len-1:5] || AES-128(server_id || nonce)` (single block if 16 bytes, else
 QUIC-LB four-pass Feistel). Stateless; reset token = `HMAC-SHA256(reset_secret, cid)[..16]`.
 See `seki-cid/src/lib.rs`.
+
+## Marks (probe resistance)
+
+`seki_cid::mark::MarkKey::stamp` writes a mark into the first 8 bytes of the client's Initial DCID
+(DCID 8..=20 bytes): 4-byte random nonce + 4-byte AES-128 tag over the nonce and the current minute.
+It looks random; Seki accepts it for ±1 minute. Seki remembers accepted DCIDs for 180 s and routes a
+DCID seen again from a different client address as unmarked (replay). The mark key must differ from
+the CID key. Metrics: `seki_flows_mark`, `seki_mark_replays`. Clients need a roughly correct clock.
 
 ## Fast path (nftables DNAT)
 

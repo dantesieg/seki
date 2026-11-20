@@ -22,6 +22,8 @@ use aes::Aes128;
 use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use hmac::{Hmac, Mac};
 
+pub mod mark;
+
 pub const MAX_CID_LEN: usize = 20;
 /// Config id reserved for unroutable CIDs.
 pub const UNROUTABLE: u8 = 7;
